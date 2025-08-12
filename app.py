@@ -65,7 +65,7 @@ use_ic = st.sidebar.checkbox("IC (Industrial‑Commercial)", value=True)
 use_im = st.sidebar.checkbox("IM (Industrial‑Mixed)", value=False)
 use_ih = st.sidebar.checkbox("IH (Industrial‑Heavy)", value=False)
 
-min_addrpts = st.sidebar.number_input("Min address points per parcel (multi‑tenant proxy)", value=2, min_value=0, step=1)
+min_addrpts = st.sidebar.number_input("Min address points per parcel (multi‑tenant proxy)", value=0, min_value=0, step=1)
 
 # scoring weights
 st.sidebar.subheader("Scoring weights")
@@ -174,7 +174,7 @@ if mode == "Auto‑fetch (no downloads)":
     if st.sidebar.button("Fetch parcels"):
         with st.spinner("Fetching parcels from City of Milwaukee…"):
             where = build_where_clause()
-            out_fields = "TAXKEY,OWNER_NAME_1,OWNER_MAIL_ADDR,OWNER_CITY_STATE,OWNER_ZIP,ZONING,LAND_USE,BLDG_AREA,UNIT"
+            out_fields = "TAXKEY,OWNER_NAME_1,OWNER_MAIL_ADDR,OWNER_CITY_STATE,OWNER_ZIP,ZONING,LAND_USE,BLDG_AREA,UNIT,HOUSE_NR_LO,SDIR,STREET,STTYPE"
             parcels = fetch_arcgis_geojson(PARCELS_LAYER, where, out_fields, geometry=extent)
 
         st.success(f"Loaded {len(parcels):,} parcels.")
@@ -183,7 +183,7 @@ if mode == "Auto‑fetch (no downloads)":
         if parcels is not None and not parcels.empty:
             with st.spinner("Fetching Address Points…"):
                 # Filter address points to the same extent if provided to keep it light
-                addrpts = fetch_arcgis_geojson(ADDRPTS_LAYER, "1=1", "StreetName,HouseNbr,Unit", geometry=extent)
+                addrpts = fetch_arcgis_geojson(ADDRPTS_LAYER, "1=1", "*", geometry=extent)
             st.success(f"Loaded {len(addrpts):,} address points.")
 
 else:
@@ -221,6 +221,11 @@ else:
 if parcels is None or len(parcels) == 0:
     st.info("⬅️ Use **Auto‑fetch** and click *Fetch parcels* (recommended), or upload a parcels file.")
     st.stop()
+
+# If no address points came back, auto-relax that filter
+if addrpts is None or len(addrpts) == 0:
+    st.warning("No address points loaded — setting the minimum address points filter to 0 for now.")
+    min_addrpts = 0
 
 # ----------------------------
 # Feature engineering
@@ -310,7 +315,10 @@ mask = (
 
 cand = work[mask].copy().sort_values("score", ascending=False)
 
-st.markdown(f"**Candidates: {len(cand):,} parcels** meet your current filters.")
+if len(cand) == 0:
+    st.error("No candidates yet. Try lowering Min building sf, setting Min address points to 0, or enabling more zoning types (IC/IM/IH).")
+else:
+    st.markdown(f"**Candidates: {len(cand):,} parcels** meet your current filters.")
 
 # ----------------------------
 # Map
