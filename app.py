@@ -1,27 +1,18 @@
 # app.py — Milwaukee Small‑Bay Industrial Finder (MVP)
 # ---------------------------------------------------
-# New: **No‑download mode** for Milwaukee — the app can auto‑fetch parcels and address points
-# straight from the City of Milwaukee ArcGIS service (geoJSON supported). If you prefer, you can
-# still upload local files. Imagery is USGS (public domain).
+# Zero‑download mode for Milwaukee: the app can auto‑fetch parcels and
+# address points directly from the City of Milwaukee ArcGIS services.
+# You can still upload your own files if you prefer.
+# Imagery uses USGS (public domain). No Google/Bing scraping.
 #
-# Run locally
-#   $ pip install streamlit geopandas shapely pydeck pandas numpy requests pyproj rtree
-#   (optional, avoids GDAL headaches): pip install pyogrio && set GeoPandas to use it
-#   $ streamlit run app.py
-#
-# Data sources used in auto‑fetch mode (public services):
-#   Parcels (MPROP_full):
-#     https://milwaukeemaps.milwaukee.gov/arcgis/rest/services/property/parcels_mprop/MapServer/2
-#     (Supports geoJSON queries; fields include TAXKEY, OWNER_*, ZONING, LAND_USE, BLDG_AREA.)
-#   Address Points:
-#     https://milwaukeemaps.milwaukee.gov/arcgis/rest/services/property/parcels_mprop/MapServer/22
-#     (Supports geoJSON; points used to estimate multi‑tenant via address counts.)
-#   Imagery: USGS ImageryOnly tile service (public domain)
+# Quick start
+#   pip install streamlit geopandas shapely pyproj pandas numpy pydeck requests rtree
+#   # (optional, smoother file I/O on cloud)
+#   pip install pyogrio
+#   streamlit run app.py
 
-import io
 import json
 import math
-import urllib.parse
 from typing import Optional
 
 import numpy as np
@@ -32,7 +23,7 @@ import streamlit as st
 import pydeck as pdk
 import requests
 
-# Optional: prefer pyogrio if installed
+# Prefer pyogrio if present
 try:
     gpd.options.io_engine = "pyogrio"
 except Exception:
@@ -41,43 +32,49 @@ except Exception:
 st.set_page_config(page_title="Milwaukee Small‑Bay Finder", layout="wide")
 st.title("Milwaukee Small‑Bay Industrial Finder — MVP")
 
-# ----------------------------
-# Sidebar — choose data source
-# ----------------------------
+# ---------------------------------
+# Constants — City of Milwaukee GIS
+# ---------------------------------
+PARCELS_LAYER = "https://milwaukeemaps.milwaukee.gov/arcgis/rest/services/property/parcels_mprop/MapServer/2"
+ADDRPTS_LAYER = "https://milwaukeemaps.milwaukee.gov/arcgis/rest/services/property/parcels_mprop/MapServer/22"
+USGS_TILES = "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}"
+
+# ---------------------------------
+# Widgets (use explicit keys to avoid duplicate IDs)
+# ---------------------------------
 st.sidebar.header("Data source")
 mode = st.sidebar.radio(
-    "Pick a mode",
+    "Data source mode",
     ["Auto‑fetch (no downloads)", "Upload files"],
     index=0,
+    key="mode_radio",
 )
 
-# ----------------------------
-# Sidebar — filters & scoring
-# ----------------------------
 st.sidebar.header("Filters & scoring")
-min_sf = st.sidebar.number_input("Min building sf", value=10000, step=1000)
-max_sf = st.sidebar.number_input("Max building sf", value=200000, step=1000)
+min_sf = st.sidebar.number_input("Min building sf", value=10000, step=1000, key="min_sf")
+max_sf = st.sidebar.number_input("Max building sf", value=200000, step=1000, key="max_sf")
 
 st.sidebar.markdown("**Industrial zoning to include (Milwaukee 295‑801):**")
-use_io = st.sidebar.checkbox("IO (Industrial‑Office)", value=True)
-use_il = st.sidebar.checkbox("IL (Industrial‑Light)", value=True)
-use_ic = st.sidebar.checkbox("IC (Industrial‑Commercial)", value=True)
-use_im = st.sidebar.checkbox("IM (Industrial‑Mixed)", value=False)
-use_ih = st.sidebar.checkbox("IH (Industrial‑Heavy)", value=False)
+use_io = st.sidebar.checkbox("IO (Industrial‑Office)", value=True, key="zone_io")
+use_il = st.sidebar.checkbox("IL (Industrial‑Light)", value=True, key="zone_il")
+use_ic = st.sidebar.checkbox("IC (Industrial‑Commercial)", value=True, key="zone_ic")
+use_im = st.sidebar.checkbox("IM (Industrial‑Mixed)", value=False, key="zone_im")
+use_ih = st.sidebar.checkbox("IH (Industrial‑Heavy)", value=False, key="zone_ih")
 
-min_addrpts = st.sidebar.number_input("Min address points per parcel (multi‑tenant proxy)", value=0, min_value=0, step=1)
+min_addrpts = st.sidebar.number_input(
+    "Min address points per parcel (multi‑tenant proxy)", value=0, min_value=0, step=1, key="min_addrpts"
+)
 
-# scoring weights
 st.sidebar.subheader("Scoring weights")
-w_zoning = st.sidebar.slider("Zoning match", 0, 5, 3)
-w_size_mid = st.sidebar.slider("Ideal size band (20k‑120k)", 0, 5, 2)
-w_addrpts = st.sidebar.slider("Address points ≥ 3", 0, 5, 2)
-w_depth = st.sidebar.slider("Shallow rectangle depth ratio", 0, 3, 1)
-score_threshold = st.sidebar.slider("Candidate score threshold", 0, 10, 5)
+w_zoning = st.sidebar.slider("Zoning match", 0, 5, 3, key="w_zoning")
+w_size_mid = st.sidebar.slider("Ideal size band (20k‑120k)", 0, 5, 2, key="w_size_mid")
+w_addrpts = st.sidebar.slider("Address points ≥ 3", 0, 5, 2, key="w_addrpts")
+w_depth = st.sidebar.slider("Shallow rectangle depth", 0, 3, 1, key="w_depth")
+score_threshold = st.sidebar.slider("Candidate score threshold", 0, 10, 5, key="score_threshold")
 
-# ----------------------------
+# ---------------------------------
 # Helpers
-# ----------------------------
+# ---------------------------------
 
 def ensure_crs(gdf: gpd.GeoDataFrame, epsg: int = 3857) -> gpd.GeoDataFrame:
     if gdf is None:
@@ -87,7 +84,7 @@ def ensure_crs(gdf: gpd.GeoDataFrame, epsg: int = 3857) -> gpd.GeoDataFrame:
     return gdf.to_crs(epsg)
 
 
-def min_rotated_rect_depth_ratio(poly) -> Optional[float]:
+def min_rotated_rect_depth_ratio(poly: Polygon) -> Optional[float]:
     try:
         mrr = poly.minimum_rotated_rectangle
         coords = list(mrr.exterior.coords)
@@ -99,10 +96,10 @@ def min_rotated_rect_depth_ratio(poly) -> Optional[float]:
         return None
 
 
-def zone_filter_str_list():
+def allow_zoning_prefixes():
     allow = []
-    if use_io: allow += ["IO%"]
-    if use_il: allow += ["IL%"]
+    if use_io: allow += ["IO"]
+    if use_il: allow += ["IL"]
     if use_ic: allow += ["IC"]
     if use_im: allow += ["IM"]
     if use_ih: allow += ["IH"]
@@ -110,19 +107,19 @@ def zone_filter_str_list():
 
 
 def build_where_clause():
-    likes = []
-    for z in zone_filter_str_list():
-        if z.endswith('%'):
-            likes.append(f"ZONING LIKE '{z}'")
-        else:
-            likes.append(f"ZONING = '{z}'")
-    z_clause = "(" + " OR ".join(likes) + ")" if likes else "1=1"
+    # ZONING may contain letter+digit (e.g., IO1, IL2) — use LIKE on prefixes
+    prefixes = allow_zoning_prefixes()
+    if prefixes:
+        likes = [f"ZONING LIKE '{p}%'" for p in prefixes]
+        z_clause = "(" + " OR ".join(likes) + ")"
+    else:
+        z_clause = "1=1"
     sf_clause = f"BLDG_AREA >= {min_sf} AND BLDG_AREA <= {max_sf}"
     return f"{z_clause} AND {sf_clause}"
 
 @st.cache_data(show_spinner=False)
-def fetch_arcgis_geojson(layer_url: str, where: str, out_fields: str, geometry: Optional[dict] = None) -> gpd.GeoDataFrame:
-    """Fetch GeoJSON from an ArcGIS Feature/MapServer layer that supports geoJSON and return a GeoDataFrame (EPSG:4326)."""
+def fetch_arcgis_geojson(layer_url: str, where: str, out_fields: str = "*", geometry: Optional[dict] = None) -> gpd.GeoDataFrame:
+    """Fetch GeoJSON from an ArcGIS layer that supports geoJSON and return a GeoDataFrame (EPSG:4326)."""
     params = {
         "where": where,
         "outFields": out_fields,
@@ -141,19 +138,16 @@ def fetch_arcgis_geojson(layer_url: str, where: str, out_fields: str, geometry: 
     r = requests.get(url, params=params, timeout=60)
     r.raise_for_status()
     gj = r.json()
-    if "features" not in gj or not gj["features"]:
-        return gpd.GeoDataFrame(columns=["geometry"], geometry=[] , crs="EPSG:4326")
-    gdf = gpd.GeoDataFrame.from_features(gj["features"], crs="EPSG:4326")
+    if not isinstance(gj, dict) or "features" not in gj:
+        return gpd.GeoDataFrame(columns=["geometry"], geometry=[], crs="EPSG:4326")
+    gdf = gpd.GeoDataFrame.from_features(gj.get("features", []), crs="EPSG:4326")
     return gdf
 
-# ----------------------------
-# Load data — two modes
-# ----------------------------
+# ---------------------------------
+# Data loading — two modes
+# ---------------------------------
 parcels = None
 addrpts = None
-
-PARCELS_LAYER = "https://milwaukeemaps.milwaukee.gov/arcgis/rest/services/property/parcels_mprop/MapServer/2"
-ADDRPTS_LAYER = "https://milwaukeemaps.milwaukee.gov/arcgis/rest/services/property/parcels_mprop/MapServer/22"
 
 if mode == "Auto‑fetch (no downloads)":
     st.sidebar.subheader("Auto‑fetch options")
@@ -161,47 +155,56 @@ if mode == "Auto‑fetch (no downloads)":
         "Area",
         ["Citywide (Industrial filter)", "Menomonee Valley demo", "Airport/College Ave demo"],
         index=0,
-        help="Use demos if you want a tiny subset to test instantly.",
+        key="extent_choice",
     )
 
-    # Simple demo extents (approximate lon/lat envelopes)
+    # Simple demo extents (lon/lat envelopes)
     extent = None
     if extent_choice == "Menomonee Valley demo":
         extent = {"xmin": -87.961, "ymin": 43.015, "xmax": -87.920, "ymax": 43.035}
     elif extent_choice == "Airport/College Ave demo":
         extent = {"xmin": -87.944, "ymin": 42.915, "xmax": -87.903, "ymax": 42.940}
 
-    if st.sidebar.button("Fetch parcels"):
+    if st.sidebar.button("Fetch parcels", key="fetch_parcels_btn"):
         with st.spinner("Fetching parcels from City of Milwaukee…"):
             where = build_where_clause()
-            out_fields = "TAXKEY,OWNER_NAME_1,OWNER_MAIL_ADDR,OWNER_CITY_STATE,OWNER_ZIP,ZONING,LAND_USE,BLDG_AREA,UNIT,HOUSE_NR_LO,SDIR,STREET,STTYPE"
+            out_fields = (
+                "TAXKEY,OWNER_NAME_1,OWNER_MAIL_ADDR,OWNER_CITY_STATE,OWNER_ZIP,"
+                "ZONING,LAND_USE,BLDG_AREA,UNIT,HOUSE_NR_LO,SDIR,STREET,STTYPE"
+            )
             parcels = fetch_arcgis_geojson(PARCELS_LAYER, where, out_fields, geometry=extent)
-
         st.success(f"Loaded {len(parcels):,} parcels.")
 
-    if st.sidebar.checkbox("Also fetch Address Points for multi‑tenant signal", value=True):
-        if parcels is not None and not parcels.empty:
-            with st.spinner("Fetching Address Points…"):
-                # Filter address points to the same extent if provided to keep it light
-                addrpts = fetch_arcgis_geojson(ADDRPTS_LAYER, "1=1", "*", geometry=extent)
-            st.success(f"Loaded {len(addrpts):,} address points.")
+    fetch_pts = st.sidebar.checkbox(
+        "Also fetch Address Points for multi‑tenant signal", value=True, key="fetch_addrpts_chk"
+    )
+    if fetch_pts and parcels is not None and not parcels.empty:
+        with st.spinner("Fetching Address Points…"):
+            addrpts = fetch_arcgis_geojson(ADDRPTS_LAYER, "1=1", out_fields="*", geometry=extent)
+        st.success(f"Loaded {len(addrpts):,} address points.")
 
 else:
-    # Upload mode
-    st.sidebar.header("Upload files")
-    parcels_file = st.sidebar.file_uploader("Parcels (GeoPackage/GeoJSON)", type=["gpkg", "geojson", "json", "zip", "shp"], help="Use GeoJSON or GeoPackage for easiest uploads.")
-    addrpts_file = st.sidebar.file_uploader("(Optional) Address Points", type=["gpkg", "geojson", "json", "zip", "shp"]) 
-    bldg_file = st.sidebar.file_uploader("(Optional) Building Footprints", type=["gpkg", "geojson", "json", "zip", "shp"]) 
+    st.sidebar.subheader("Upload files")
+    parcels_file = st.sidebar.file_uploader(
+        "Parcels (GeoPackage/GeoJSON/Shapefile)",
+        type=["gpkg", "geojson", "json", "zip", "shp"],
+        key="upload_parcels",
+    )
+    addrpts_file = st.sidebar.file_uploader(
+        "(Optional) Address Points",
+        type=["gpkg", "geojson", "json", "zip", "shp"],
+        key="upload_addrpts",
+    )
+    bldg_file = st.sidebar.file_uploader(
+        "(Optional) Building Footprints",
+        type=["gpkg", "geojson", "json", "zip", "shp"],
+        key="upload_bldgs",
+    )
 
     def read_any_vector(file) -> gpd.GeoDataFrame:
         if file is None:
             return None
-        name = file.name.lower()
-        if name.endswith(".gpkg") or name.endswith(".geojson") or name.endswith(".json"):
-            return gpd.read_file(file)
-        if name.endswith(".zip") or name.endswith(".shp"):
-            return gpd.read_file(file)
-        raise ValueError("Unsupported format.")
+        return gpd.read_file(file)
 
     if parcels_file:
         parcels = read_any_vector(parcels_file)
@@ -217,20 +220,14 @@ else:
             parcels = parcels.copy()
             parcels["BLDG_AREA"] = sums
 
-# Stop early if no parcels yet
+# Guard — need parcels to proceed
 if parcels is None or len(parcels) == 0:
     st.info("⬅️ Use **Auto‑fetch** and click *Fetch parcels* (recommended), or upload a parcels file.")
     st.stop()
 
-# If no address points came back, auto-relax that filter
-if addrpts is None or len(addrpts) == 0:
-    st.warning("No address points loaded — setting the minimum address points filter to 0 for now.")
-    min_addrpts = 0
-
-# ----------------------------
+# ---------------------------------
 # Feature engineering
-# ----------------------------
-# Normalize columns
+# ---------------------------------
 cols_lower = {c.lower(): c for c in parcels.columns}
 getc = lambda *names: next((cols_lower[n] for n in names if n in cols_lower), None)
 
@@ -243,7 +240,7 @@ zoning_col = getc("zoning")
 landuse_col = getc("land_use", "landuse")
 bldg_col = getc("bldg_area", "imprv_sqft", "bldg_sqft", "imprv_area")
 
-# If missing building area, fill with 0 so filters work
+# Fill missing BLDG_AREA with NaN so filters work
 if bldg_col is None:
     parcels["BLDG_AREA"] = np.nan
     bldg_col = "BLDG_AREA"
@@ -263,35 +260,28 @@ if addrpts is not None and not addrpts.empty:
 work = parcels.copy()
 work["addr_count"] = addr_count
 
-# Zoning flag
-allow_z = []
-if use_io: allow_z += ["IO1", "IO2"]
-if use_il: allow_z += ["IL1", "IL2"]
-if use_ic: allow_z += ["IC"]
-if use_im: allow_z += ["IM"]
-if use_ih: allow_z += ["IH"]
-
-if zoning_col is not None:
-    ztxt = work[zoning_col].astype(str).str.upper()
-    work["zoning_ok"] = False
-    work.loc[ztxt.str.startswith(tuple([z[:2] for z in allow_z if z.endswith(('1','2'))])) | ztxt.isin(allow_z), "zoning_ok"] = True
+# Zoning flag (prefix check)
+allow_prefixes = allow_zoning_prefixes()
+if zoning_col is not None and allow_prefixes:
+    ztxt = work[zoning_col].astype(str).str.upper().fillna("")
+    work["zoning_ok"] = ztxt.str.startswith(tuple(allow_prefixes)) | ztxt.isin(allow_prefixes)
 else:
-    work["zoning_ok"] = True  # if no zoning column, don’t exclude
+    work["zoning_ok"] = True  # if no zoning, don’t exclude
 
-# Size filter
+# Size filter & depth ratio
 work["bldg_sf"] = pd.to_numeric(work[bldg_col], errors="coerce")
-
-# Depth ratio proxy (in projected meters/feet). Project to Web Mercator to measure.
 work_3857 = ensure_crs(work)
 work["depth_ratio"] = work_3857.geometry.apply(min_rotated_rect_depth_ratio)
 
-# Score
+# Scoring
+
 def size_band_points(sf: float) -> int:
     if sf is None or np.isnan(sf):
         return 0
     if 20000 <= sf <= 120000:
         return w_size_mid
     return 1 if (min_sf <= sf <= max_sf) else 0
+
 
 def compute_score(row) -> int:
     score = 0
@@ -306,28 +296,32 @@ def compute_score(row) -> int:
 
 work["score"] = work.apply(compute_score, axis=1)
 
+# Effective min address points (auto‑relax if none loaded)
+addrpts_loaded = addrpts is not None and len(addrpts) > 0
+effective_min_addrpts = min_addrpts if addrpts_loaded else 0
+if not addrpts_loaded:
+    st.warning("No address points loaded — using Min address points = 0 for filtering.")
+
 # Apply hard filters
 mask = (
     work["bldg_sf"].between(min_sf, max_sf, inclusive="both") &
     work["zoning_ok"] &
-    (work["addr_count"] >= min_addrpts)
+    (work["addr_count"] >= effective_min_addrpts)
 )
 
 cand = work[mask].copy().sort_values("score", ascending=False)
 
 if len(cand) == 0:
-    st.error("No candidates yet. Try lowering Min building sf, setting Min address points to 0, or enabling more zoning types (IC/IM/IH).")
+    st.error("No candidates yet. Try lowering Min building sf, enabling more zoning types (IC/IM/IH), or widen the area.")
 else:
     st.markdown(f"**Candidates: {len(cand):,} parcels** meet your current filters.")
 
-# ----------------------------
+# ---------------------------------
 # Map
-# ----------------------------
+# ---------------------------------
 initial_view = pdk.ViewState(latitude=43.0389, longitude=-87.9065, zoom=11)
 
-usgs_tiles = "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}"
-
-tile_layer = pdk.Layer("TileLayer", data=usgs_tiles, min_zoom=0, max_zoom=19, tile_size=256)
+tile_layer = pdk.Layer("TileLayer", data=USGS_TILES, min_zoom=0, max_zoom=19, tile_size=256)
 
 cand_geojson = json.loads(cand.to_crs(4326).to_json()) if len(cand) else {"type":"FeatureCollection","features":[]}
 poly_layer = pdk.Layer(
@@ -342,16 +336,15 @@ poly_layer = pdk.Layer(
 )
 
 r = pdk.Deck(layers=[tile_layer, poly_layer], initial_view_state=initial_view, map_provider=None)
-st.pydeck_chart(r)
+st.pydeck_chart(r, use_container_width=True)
 
-st.caption("Imagery: USGS The National Map (USGSImageryOnly). Parcels & address points: City of Milwaukee MapServer (geoJSON queries).")
+st.caption("Imagery: USGS The National Map (USGSImageryOnly). Parcels & Address Points: City of Milwaukee MapServer (GeoJSON).")
 
-# ----------------------------
+# ---------------------------------
 # Export call sheet
-# ----------------------------
+# ---------------------------------
 export_cols = {
     "APN": apn_col,
-    "Property Address": None,  # composed below if street fields exist
     "Zoning": zoning_col,
     "Building SF": "bldg_sf",
     "Address Count": "addr_count",
@@ -363,18 +356,19 @@ export_cols = {
     "Owner Zip": mail_zip_col,
 }
 
-# Try composing a street address if fields exist
-street_parts = [p for p in ["house_nr_lo", "sdir", "street", "sttype", "unit"] if p in cols_lower]
-if street_parts:
+# Compose a property address if street fields exist
+cols_lower = {c.lower(): c for c in work.columns}
+parts = [cols_lower.get(p) for p in ["house_nr_lo", "sdir", "street", "sttype", "unit"] if cols_lower.get(p)]
+if parts:
     addr_series = (
-        work[cols_lower.get("house_nr_lo")].fillna("").astype(str).str.replace(".0$","", regex=True) + " " +
-        work[cols_lower.get("sdir")].fillna("").astype(str) + " " +
-        work[cols_lower.get("street")].fillna("").astype(str) + " " +
-        work[cols_lower.get("sttype")].fillna("").astype(str) +
-        (" #" + work[cols_lower.get("unit")].astype(str)).where(work[cols_lower.get("unit")].notna(), "")
+        work.get(cols_lower.get("house_nr_lo"), pd.Series("")).astype(str).str.replace(".0$", "", regex=True) + " " +
+        work.get(cols_lower.get("sdir"), pd.Series("")).astype(str) + " " +
+        work.get(cols_lower.get("street"), pd.Series("")).astype(str) + " " +
+        work.get(cols_lower.get("sttype"), pd.Series("")).astype(str) +
+        (" #" + work.get(cols_lower.get("unit"), pd.Series("")).astype(str)).where(work.get(cols_lower.get("unit"), pd.Series("")).astype(str).ne(""), "")
     ).str.replace(" +", " ", regex=True).str.strip()
-    work["_site_addr"] = addr_series
-    export_cols["Property Address"] = "_site_addr"
+    work["Property Address"] = addr_series
+    export_cols = {"Property Address": "Property Address", **export_cols}
 
 final_cols = [v for v in export_cols.values() if v is not None and v in work.columns]
 export_df = work.loc[cand.index, final_cols].copy()
@@ -384,43 +378,38 @@ st.subheader("Export call sheet")
 st.dataframe(export_df.head(50))
 
 csv = export_df.to_csv(index=False).encode("utf-8")
-st.download_button("Download CSV", csv, file_name="milwaukee_small_bay_calls.csv", mime="text/csv")
+st.download_button("Download CSV", csv, file_name="milwaukee_small_bay_calls.csv", mime="text/csv", key="dl_csv")
 
-with st.expander("Notes / Tips"):
-    st.markdown(
-        """
-        **No‑download mode** hits the City of Milwaukee MapServer layers and requests **geoJSON** directly.
-        The parcels layer explicitly supports geoJSON and includes **ZONING** and **BLDG_AREA** fields.
-
-        Use the **demo extents** if you just want to sanity‑check the workflow with a tiny subset.
-
-        Want to save review labels and call outcomes? Wire a Postgres DB and add a `verifications` table.
-        """
-    )
+# ---------------------------------
+# Diagnostics
+# ---------------------------------
+with st.expander("Diagnostics"):
+    st.write({
+        "parcels_loaded": 0 if parcels is None else len(parcels),
+        "addrpts_loaded": 0 if addrpts is None else len(addrpts),
+        "candidates": len(cand),
+        "filters": {
+            "min_sf": min_sf,
+            "max_sf": max_sf,
+            "zoning_prefixes": allow_zoning_prefixes(),
+            "min_addrpts_effective": effective_min_addrpts,
+        },
+    })
 # app.py — Milwaukee Small‑Bay Industrial Finder (MVP)
 # ---------------------------------------------------
-# New: **No‑download mode** for Milwaukee — the app can auto‑fetch parcels and address points
-# straight from the City of Milwaukee ArcGIS service (geoJSON supported). If you prefer, you can
-# still upload local files. Imagery is USGS (public domain).
+# Zero‑download mode for Milwaukee: the app can auto‑fetch parcels and
+# address points directly from the City of Milwaukee ArcGIS services.
+# You can still upload your own files if you prefer.
+# Imagery uses USGS (public domain). No Google/Bing scraping.
 #
-# Run locally
-#   $ pip install streamlit geopandas shapely pydeck pandas numpy requests pyproj rtree
-#   (optional, avoids GDAL headaches): pip install pyogrio && set GeoPandas to use it
-#   $ streamlit run app.py
-#
-# Data sources used in auto‑fetch mode (public services):
-#   Parcels (MPROP_full):
-#     https://milwaukeemaps.milwaukee.gov/arcgis/rest/services/property/parcels_mprop/MapServer/2
-#     (Supports geoJSON queries; fields include TAXKEY, OWNER_*, ZONING, LAND_USE, BLDG_AREA.)
-#   Address Points:
-#     https://milwaukeemaps.milwaukee.gov/arcgis/rest/services/property/parcels_mprop/MapServer/22
-#     (Supports geoJSON; points used to estimate multi‑tenant via address counts.)
-#   Imagery: USGS ImageryOnly tile service (public domain)
+# Quick start
+#   pip install streamlit geopandas shapely pyproj pandas numpy pydeck requests rtree
+#   # (optional, smoother file I/O on cloud)
+#   pip install pyogrio
+#   streamlit run app.py
 
-import io
 import json
 import math
-import urllib.parse
 from typing import Optional
 
 import numpy as np
@@ -431,7 +420,7 @@ import streamlit as st
 import pydeck as pdk
 import requests
 
-# Optional: prefer pyogrio if installed
+# Prefer pyogrio if present
 try:
     gpd.options.io_engine = "pyogrio"
 except Exception:
@@ -440,43 +429,49 @@ except Exception:
 st.set_page_config(page_title="Milwaukee Small‑Bay Finder", layout="wide")
 st.title("Milwaukee Small‑Bay Industrial Finder — MVP")
 
-# ----------------------------
-# Sidebar — choose data source
-# ----------------------------
+# ---------------------------------
+# Constants — City of Milwaukee GIS
+# ---------------------------------
+PARCELS_LAYER = "https://milwaukeemaps.milwaukee.gov/arcgis/rest/services/property/parcels_mprop/MapServer/2"
+ADDRPTS_LAYER = "https://milwaukeemaps.milwaukee.gov/arcgis/rest/services/property/parcels_mprop/MapServer/22"
+USGS_TILES = "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}"
+
+# ---------------------------------
+# Widgets (use explicit keys to avoid duplicate IDs)
+# ---------------------------------
 st.sidebar.header("Data source")
 mode = st.sidebar.radio(
-    "Pick a mode",
+    "Data source mode",
     ["Auto‑fetch (no downloads)", "Upload files"],
     index=0,
+    key="mode_radio",
 )
 
-# ----------------------------
-# Sidebar — filters & scoring
-# ----------------------------
 st.sidebar.header("Filters & scoring")
-min_sf = st.sidebar.number_input("Min building sf", value=10000, step=1000)
-max_sf = st.sidebar.number_input("Max building sf", value=200000, step=1000)
+min_sf = st.sidebar.number_input("Min building sf", value=10000, step=1000, key="min_sf")
+max_sf = st.sidebar.number_input("Max building sf", value=200000, step=1000, key="max_sf")
 
 st.sidebar.markdown("**Industrial zoning to include (Milwaukee 295‑801):**")
-use_io = st.sidebar.checkbox("IO (Industrial‑Office)", value=True)
-use_il = st.sidebar.checkbox("IL (Industrial‑Light)", value=True)
-use_ic = st.sidebar.checkbox("IC (Industrial‑Commercial)", value=True)
-use_im = st.sidebar.checkbox("IM (Industrial‑Mixed)", value=False)
-use_ih = st.sidebar.checkbox("IH (Industrial‑Heavy)", value=False)
+use_io = st.sidebar.checkbox("IO (Industrial‑Office)", value=True, key="zone_io")
+use_il = st.sidebar.checkbox("IL (Industrial‑Light)", value=True, key="zone_il")
+use_ic = st.sidebar.checkbox("IC (Industrial‑Commercial)", value=True, key="zone_ic")
+use_im = st.sidebar.checkbox("IM (Industrial‑Mixed)", value=False, key="zone_im")
+use_ih = st.sidebar.checkbox("IH (Industrial‑Heavy)", value=False, key="zone_ih")
 
-min_addrpts = st.sidebar.number_input("Min address points per parcel (multi‑tenant proxy)", value=2, min_value=0, step=1)
+min_addrpts = st.sidebar.number_input(
+    "Min address points per parcel (multi‑tenant proxy)", value=0, min_value=0, step=1, key="min_addrpts"
+)
 
-# scoring weights
 st.sidebar.subheader("Scoring weights")
-w_zoning = st.sidebar.slider("Zoning match", 0, 5, 3)
-w_size_mid = st.sidebar.slider("Ideal size band (20k‑120k)", 0, 5, 2)
-w_addrpts = st.sidebar.slider("Address points ≥ 3", 0, 5, 2)
-w_depth = st.sidebar.slider("Shallow rectangle depth ratio", 0, 3, 1)
-score_threshold = st.sidebar.slider("Candidate score threshold", 0, 10, 5)
+w_zoning = st.sidebar.slider("Zoning match", 0, 5, 3, key="w_zoning")
+w_size_mid = st.sidebar.slider("Ideal size band (20k‑120k)", 0, 5, 2, key="w_size_mid")
+w_addrpts = st.sidebar.slider("Address points ≥ 3", 0, 5, 2, key="w_addrpts")
+w_depth = st.sidebar.slider("Shallow rectangle depth", 0, 3, 1, key="w_depth")
+score_threshold = st.sidebar.slider("Candidate score threshold", 0, 10, 5, key="score_threshold")
 
-# ----------------------------
+# ---------------------------------
 # Helpers
-# ----------------------------
+# ---------------------------------
 
 def ensure_crs(gdf: gpd.GeoDataFrame, epsg: int = 3857) -> gpd.GeoDataFrame:
     if gdf is None:
@@ -486,7 +481,7 @@ def ensure_crs(gdf: gpd.GeoDataFrame, epsg: int = 3857) -> gpd.GeoDataFrame:
     return gdf.to_crs(epsg)
 
 
-def min_rotated_rect_depth_ratio(poly) -> Optional[float]:
+def min_rotated_rect_depth_ratio(poly: Polygon) -> Optional[float]:
     try:
         mrr = poly.minimum_rotated_rectangle
         coords = list(mrr.exterior.coords)
@@ -498,10 +493,10 @@ def min_rotated_rect_depth_ratio(poly) -> Optional[float]:
         return None
 
 
-def zone_filter_str_list():
+def allow_zoning_prefixes():
     allow = []
-    if use_io: allow += ["IO%"]
-    if use_il: allow += ["IL%"]
+    if use_io: allow += ["IO"]
+    if use_il: allow += ["IL"]
     if use_ic: allow += ["IC"]
     if use_im: allow += ["IM"]
     if use_ih: allow += ["IH"]
@@ -509,19 +504,19 @@ def zone_filter_str_list():
 
 
 def build_where_clause():
-    likes = []
-    for z in zone_filter_str_list():
-        if z.endswith('%'):
-            likes.append(f"ZONING LIKE '{z}'")
-        else:
-            likes.append(f"ZONING = '{z}'")
-    z_clause = "(" + " OR ".join(likes) + ")" if likes else "1=1"
+    # ZONING may contain letter+digit (e.g., IO1, IL2) — use LIKE on prefixes
+    prefixes = allow_zoning_prefixes()
+    if prefixes:
+        likes = [f"ZONING LIKE '{p}%'" for p in prefixes]
+        z_clause = "(" + " OR ".join(likes) + ")"
+    else:
+        z_clause = "1=1"
     sf_clause = f"BLDG_AREA >= {min_sf} AND BLDG_AREA <= {max_sf}"
     return f"{z_clause} AND {sf_clause}"
 
 @st.cache_data(show_spinner=False)
-def fetch_arcgis_geojson(layer_url: str, where: str, out_fields: str, geometry: Optional[dict] = None) -> gpd.GeoDataFrame:
-    """Fetch GeoJSON from an ArcGIS Feature/MapServer layer that supports geoJSON and return a GeoDataFrame (EPSG:4326)."""
+def fetch_arcgis_geojson(layer_url: str, where: str, out_fields: str = "*", geometry: Optional[dict] = None) -> gpd.GeoDataFrame:
+    """Fetch GeoJSON from an ArcGIS layer that supports geoJSON and return a GeoDataFrame (EPSG:4326)."""
     params = {
         "where": where,
         "outFields": out_fields,
@@ -540,19 +535,16 @@ def fetch_arcgis_geojson(layer_url: str, where: str, out_fields: str, geometry: 
     r = requests.get(url, params=params, timeout=60)
     r.raise_for_status()
     gj = r.json()
-    if "features" not in gj or not gj["features"]:
-        return gpd.GeoDataFrame(columns=["geometry"], geometry=[] , crs="EPSG:4326")
-    gdf = gpd.GeoDataFrame.from_features(gj["features"], crs="EPSG:4326")
+    if not isinstance(gj, dict) or "features" not in gj:
+        return gpd.GeoDataFrame(columns=["geometry"], geometry=[], crs="EPSG:4326")
+    gdf = gpd.GeoDataFrame.from_features(gj.get("features", []), crs="EPSG:4326")
     return gdf
 
-# ----------------------------
-# Load data — two modes
-# ----------------------------
+# ---------------------------------
+# Data loading — two modes
+# ---------------------------------
 parcels = None
 addrpts = None
-
-PARCELS_LAYER = "https://milwaukeemaps.milwaukee.gov/arcgis/rest/services/property/parcels_mprop/MapServer/2"
-ADDRPTS_LAYER = "https://milwaukeemaps.milwaukee.gov/arcgis/rest/services/property/parcels_mprop/MapServer/22"
 
 if mode == "Auto‑fetch (no downloads)":
     st.sidebar.subheader("Auto‑fetch options")
@@ -560,47 +552,56 @@ if mode == "Auto‑fetch (no downloads)":
         "Area",
         ["Citywide (Industrial filter)", "Menomonee Valley demo", "Airport/College Ave demo"],
         index=0,
-        help="Use demos if you want a tiny subset to test instantly.",
+        key="extent_choice",
     )
 
-    # Simple demo extents (approximate lon/lat envelopes)
+    # Simple demo extents (lon/lat envelopes)
     extent = None
     if extent_choice == "Menomonee Valley demo":
         extent = {"xmin": -87.961, "ymin": 43.015, "xmax": -87.920, "ymax": 43.035}
     elif extent_choice == "Airport/College Ave demo":
         extent = {"xmin": -87.944, "ymin": 42.915, "xmax": -87.903, "ymax": 42.940}
 
-    if st.sidebar.button("Fetch parcels"):
+    if st.sidebar.button("Fetch parcels", key="fetch_parcels_btn"):
         with st.spinner("Fetching parcels from City of Milwaukee…"):
             where = build_where_clause()
-            out_fields = "TAXKEY,OWNER_NAME_1,OWNER_MAIL_ADDR,OWNER_CITY_STATE,OWNER_ZIP,ZONING,LAND_USE,BLDG_AREA,UNIT"
+            out_fields = (
+                "TAXKEY,OWNER_NAME_1,OWNER_MAIL_ADDR,OWNER_CITY_STATE,OWNER_ZIP,"
+                "ZONING,LAND_USE,BLDG_AREA,UNIT,HOUSE_NR_LO,SDIR,STREET,STTYPE"
+            )
             parcels = fetch_arcgis_geojson(PARCELS_LAYER, where, out_fields, geometry=extent)
-
         st.success(f"Loaded {len(parcels):,} parcels.")
 
-    if st.sidebar.checkbox("Also fetch Address Points for multi‑tenant signal", value=True):
-        if parcels is not None and not parcels.empty:
-            with st.spinner("Fetching Address Points…"):
-                # Filter address points to the same extent if provided to keep it light
-                addrpts = fetch_arcgis_geojson(ADDRPTS_LAYER, "1=1", "StreetName,HouseNbr,Unit", geometry=extent)
-            st.success(f"Loaded {len(addrpts):,} address points.")
+    fetch_pts = st.sidebar.checkbox(
+        "Also fetch Address Points for multi‑tenant signal", value=True, key="fetch_addrpts_chk"
+    )
+    if fetch_pts and parcels is not None and not parcels.empty:
+        with st.spinner("Fetching Address Points…"):
+            addrpts = fetch_arcgis_geojson(ADDRPTS_LAYER, "1=1", out_fields="*", geometry=extent)
+        st.success(f"Loaded {len(addrpts):,} address points.")
 
 else:
-    # Upload mode
-    st.sidebar.header("Upload files")
-    parcels_file = st.sidebar.file_uploader("Parcels (GeoPackage/GeoJSON)", type=["gpkg", "geojson", "json", "zip", "shp"], help="Use GeoJSON or GeoPackage for easiest uploads.")
-    addrpts_file = st.sidebar.file_uploader("(Optional) Address Points", type=["gpkg", "geojson", "json", "zip", "shp"]) 
-    bldg_file = st.sidebar.file_uploader("(Optional) Building Footprints", type=["gpkg", "geojson", "json", "zip", "shp"]) 
+    st.sidebar.subheader("Upload files")
+    parcels_file = st.sidebar.file_uploader(
+        "Parcels (GeoPackage/GeoJSON/Shapefile)",
+        type=["gpkg", "geojson", "json", "zip", "shp"],
+        key="upload_parcels",
+    )
+    addrpts_file = st.sidebar.file_uploader(
+        "(Optional) Address Points",
+        type=["gpkg", "geojson", "json", "zip", "shp"],
+        key="upload_addrpts",
+    )
+    bldg_file = st.sidebar.file_uploader(
+        "(Optional) Building Footprints",
+        type=["gpkg", "geojson", "json", "zip", "shp"],
+        key="upload_bldgs",
+    )
 
     def read_any_vector(file) -> gpd.GeoDataFrame:
         if file is None:
             return None
-        name = file.name.lower()
-        if name.endswith(".gpkg") or name.endswith(".geojson") or name.endswith(".json"):
-            return gpd.read_file(file)
-        if name.endswith(".zip") or name.endswith(".shp"):
-            return gpd.read_file(file)
-        raise ValueError("Unsupported format.")
+        return gpd.read_file(file)
 
     if parcels_file:
         parcels = read_any_vector(parcels_file)
@@ -616,15 +617,14 @@ else:
             parcels = parcels.copy()
             parcels["BLDG_AREA"] = sums
 
-# Stop early if no parcels yet
+# Guard — need parcels to proceed
 if parcels is None or len(parcels) == 0:
     st.info("⬅️ Use **Auto‑fetch** and click *Fetch parcels* (recommended), or upload a parcels file.")
     st.stop()
 
-# ----------------------------
+# ---------------------------------
 # Feature engineering
-# ----------------------------
-# Normalize columns
+# ---------------------------------
 cols_lower = {c.lower(): c for c in parcels.columns}
 getc = lambda *names: next((cols_lower[n] for n in names if n in cols_lower), None)
 
@@ -637,7 +637,7 @@ zoning_col = getc("zoning")
 landuse_col = getc("land_use", "landuse")
 bldg_col = getc("bldg_area", "imprv_sqft", "bldg_sqft", "imprv_area")
 
-# If missing building area, fill with 0 so filters work
+# Fill missing BLDG_AREA with NaN so filters work
 if bldg_col is None:
     parcels["BLDG_AREA"] = np.nan
     bldg_col = "BLDG_AREA"
@@ -657,35 +657,28 @@ if addrpts is not None and not addrpts.empty:
 work = parcels.copy()
 work["addr_count"] = addr_count
 
-# Zoning flag
-allow_z = []
-if use_io: allow_z += ["IO1", "IO2"]
-if use_il: allow_z += ["IL1", "IL2"]
-if use_ic: allow_z += ["IC"]
-if use_im: allow_z += ["IM"]
-if use_ih: allow_z += ["IH"]
-
-if zoning_col is not None:
-    ztxt = work[zoning_col].astype(str).str.upper()
-    work["zoning_ok"] = False
-    work.loc[ztxt.str.startswith(tuple([z[:2] for z in allow_z if z.endswith(('1','2'))])) | ztxt.isin(allow_z), "zoning_ok"] = True
+# Zoning flag (prefix check)
+allow_prefixes = allow_zoning_prefixes()
+if zoning_col is not None and allow_prefixes:
+    ztxt = work[zoning_col].astype(str).str.upper().fillna("")
+    work["zoning_ok"] = ztxt.str.startswith(tuple(allow_prefixes)) | ztxt.isin(allow_prefixes)
 else:
-    work["zoning_ok"] = True  # if no zoning column, don’t exclude
+    work["zoning_ok"] = True  # if no zoning, don’t exclude
 
-# Size filter
+# Size filter & depth ratio
 work["bldg_sf"] = pd.to_numeric(work[bldg_col], errors="coerce")
-
-# Depth ratio proxy (in projected meters/feet). Project to Web Mercator to measure.
 work_3857 = ensure_crs(work)
 work["depth_ratio"] = work_3857.geometry.apply(min_rotated_rect_depth_ratio)
 
-# Score
+# Scoring
+
 def size_band_points(sf: float) -> int:
     if sf is None or np.isnan(sf):
         return 0
     if 20000 <= sf <= 120000:
         return w_size_mid
     return 1 if (min_sf <= sf <= max_sf) else 0
+
 
 def compute_score(row) -> int:
     score = 0
@@ -700,25 +693,32 @@ def compute_score(row) -> int:
 
 work["score"] = work.apply(compute_score, axis=1)
 
+# Effective min address points (auto‑relax if none loaded)
+addrpts_loaded = addrpts is not None and len(addrpts) > 0
+effective_min_addrpts = min_addrpts if addrpts_loaded else 0
+if not addrpts_loaded:
+    st.warning("No address points loaded — using Min address points = 0 for filtering.")
+
 # Apply hard filters
 mask = (
     work["bldg_sf"].between(min_sf, max_sf, inclusive="both") &
     work["zoning_ok"] &
-    (work["addr_count"] >= min_addrpts)
+    (work["addr_count"] >= effective_min_addrpts)
 )
 
 cand = work[mask].copy().sort_values("score", ascending=False)
 
-st.markdown(f"**Candidates: {len(cand):,} parcels** meet your current filters.")
+if len(cand) == 0:
+    st.error("No candidates yet. Try lowering Min building sf, enabling more zoning types (IC/IM/IH), or widen the area.")
+else:
+    st.markdown(f"**Candidates: {len(cand):,} parcels** meet your current filters.")
 
-# ----------------------------
+# ---------------------------------
 # Map
-# ----------------------------
+# ---------------------------------
 initial_view = pdk.ViewState(latitude=43.0389, longitude=-87.9065, zoom=11)
 
-usgs_tiles = "https://basemap.nationalmap.gov/arcgis/rest/services/USGSImageryOnly/MapServer/tile/{z}/{y}/{x}"
-
-tile_layer = pdk.Layer("TileLayer", data=usgs_tiles, min_zoom=0, max_zoom=19, tile_size=256)
+tile_layer = pdk.Layer("TileLayer", data=USGS_TILES, min_zoom=0, max_zoom=19, tile_size=256)
 
 cand_geojson = json.loads(cand.to_crs(4326).to_json()) if len(cand) else {"type":"FeatureCollection","features":[]}
 poly_layer = pdk.Layer(
@@ -733,16 +733,15 @@ poly_layer = pdk.Layer(
 )
 
 r = pdk.Deck(layers=[tile_layer, poly_layer], initial_view_state=initial_view, map_provider=None)
-st.pydeck_chart(r)
+st.pydeck_chart(r, use_container_width=True)
 
-st.caption("Imagery: USGS The National Map (USGSImageryOnly). Parcels & address points: City of Milwaukee MapServer (geoJSON queries).")
+st.caption("Imagery: USGS The National Map (USGSImageryOnly). Parcels & Address Points: City of Milwaukee MapServer (GeoJSON).")
 
-# ----------------------------
+# ---------------------------------
 # Export call sheet
-# ----------------------------
+# ---------------------------------
 export_cols = {
     "APN": apn_col,
-    "Property Address": None,  # composed below if street fields exist
     "Zoning": zoning_col,
     "Building SF": "bldg_sf",
     "Address Count": "addr_count",
@@ -754,18 +753,19 @@ export_cols = {
     "Owner Zip": mail_zip_col,
 }
 
-# Try composing a street address if fields exist
-street_parts = [p for p in ["house_nr_lo", "sdir", "street", "sttype", "unit"] if p in cols_lower]
-if street_parts:
+# Compose a property address if street fields exist
+cols_lower = {c.lower(): c for c in work.columns}
+parts = [cols_lower.get(p) for p in ["house_nr_lo", "sdir", "street", "sttype", "unit"] if cols_lower.get(p)]
+if parts:
     addr_series = (
-        work[cols_lower.get("house_nr_lo")].fillna("").astype(str).str.replace(".0$","", regex=True) + " " +
-        work[cols_lower.get("sdir")].fillna("").astype(str) + " " +
-        work[cols_lower.get("street")].fillna("").astype(str) + " " +
-        work[cols_lower.get("sttype")].fillna("").astype(str) +
-        (" #" + work[cols_lower.get("unit")].astype(str)).where(work[cols_lower.get("unit")].notna(), "")
+        work.get(cols_lower.get("house_nr_lo"), pd.Series("")).astype(str).str.replace(".0$", "", regex=True) + " " +
+        work.get(cols_lower.get("sdir"), pd.Series("")).astype(str) + " " +
+        work.get(cols_lower.get("street"), pd.Series("")).astype(str) + " " +
+        work.get(cols_lower.get("sttype"), pd.Series("")).astype(str) +
+        (" #" + work.get(cols_lower.get("unit"), pd.Series("")).astype(str)).where(work.get(cols_lower.get("unit"), pd.Series("")).astype(str).ne(""), "")
     ).str.replace(" +", " ", regex=True).str.strip()
-    work["_site_addr"] = addr_series
-    export_cols["Property Address"] = "_site_addr"
+    work["Property Address"] = addr_series
+    export_cols = {"Property Address": "Property Address", **export_cols}
 
 final_cols = [v for v in export_cols.values() if v is not None and v in work.columns]
 export_df = work.loc[cand.index, final_cols].copy()
@@ -775,16 +775,20 @@ st.subheader("Export call sheet")
 st.dataframe(export_df.head(50))
 
 csv = export_df.to_csv(index=False).encode("utf-8")
-st.download_button("Download CSV", csv, file_name="milwaukee_small_bay_calls.csv", mime="text/csv")
+st.download_button("Download CSV", csv, file_name="milwaukee_small_bay_calls.csv", mime="text/csv", key="dl_csv")
 
-with st.expander("Notes / Tips"):
-    st.markdown(
-        """
-        **No‑download mode** hits the City of Milwaukee MapServer layers and requests **geoJSON** directly.
-        The parcels layer explicitly supports geoJSON and includes **ZONING** and **BLDG_AREA** fields.
-
-        Use the **demo extents** if you just want to sanity‑check the workflow with a tiny subset.
-
-        Want to save review labels and call outcomes? Wire a Postgres DB and add a `verifications` table.
-        """
-    )
+# ---------------------------------
+# Diagnostics
+# ---------------------------------
+with st.expander("Diagnostics"):
+    st.write({
+        "parcels_loaded": 0 if parcels is None else len(parcels),
+        "addrpts_loaded": 0 if addrpts is None else len(addrpts),
+        "candidates": len(cand),
+        "filters": {
+            "min_sf": min_sf,
+            "max_sf": max_sf,
+            "zoning_prefixes": allow_zoning_prefixes(),
+            "min_addrpts_effective": effective_min_addrpts,
+        },
+    })
